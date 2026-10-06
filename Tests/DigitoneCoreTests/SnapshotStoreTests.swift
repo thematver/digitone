@@ -25,6 +25,159 @@ final class SnapshotStoreTests: XCTestCase {
         }
     }
 
+    func testFavoriteRoundTripKeepsSchemaOne() throws {
+        try withStore { store in
+            var sound = snapshot()
+            XCTAssertFalse(sound.isFavorite)
+            sound.isFavorite = true
+            try store.save([sound])
+            XCTAssertEqual(try store.load(), [sound])
+            let data = try Data(contentsOf: store.fileURL)
+            let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            XCTAssertEqual(object["schemaVersion"] as? Int, 1)
+            XCTAssertEqual(try SnapshotArchive.decode(data), [sound])
+        }
+    }
+
+    func testLegacyLibraryWithoutTagsAndFavoriteLoadsAndCanBeSaved() throws {
+        try withStore { store in
+            let sound = snapshot()
+            var object = try XCTUnwrap(JSONSerialization.jsonObject(with: SnapshotArchive.encode([sound])) as? [String: Any])
+            var sounds = try XCTUnwrap(object["snapshots"] as? [[String: Any]])
+            sounds[0].removeValue(forKey: "tags")
+            sounds[0].removeValue(forKey: "isFavorite")
+            object["snapshots"] = sounds
+            try FileManager.default.createDirectory(at: store.directory, withIntermediateDirectories: true)
+            try JSONSerialization.data(withJSONObject: object).write(to: store.fileURL)
+            var expected = sound
+            expected.tags = []
+            XCTAssertEqual(try store.load(), [expected])
+            expected.isFavorite = true
+            try store.save([expected])
+            XCTAssertEqual(try store.load(), [expected])
+        }
+    }
+
+    func testSchemaOneWithoutFavoritePreservesExistingTags() throws {
+        let sound = snapshot()
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: SnapshotArchive.encode([sound])) as? [String: Any])
+        var sounds = try XCTUnwrap(object["snapshots"] as? [[String: Any]])
+        sounds[0].removeValue(forKey: "isFavorite")
+        object["snapshots"] = sounds
+        XCTAssertEqual(try SnapshotArchive.decode(JSONSerialization.data(withJSONObject: object)), [sound])
+    }
+
+    func testTagsAreTrimmedDeduplicatedAndKeepFirstSpelling() {
+        XCTAssertEqual(SoundSnapshot.normalizedTags(from: "  Pad, , Холодный, pad,\nХОЛОДНЫЙ , Bass  "),
+                       ["Pad", "Холодный", "Bass"])
+        XCTAssertEqual(SoundSnapshot.normalizedTags(from: " , \n ,"), [])
+    }
+
+    func testArchiveRoundTripPreservesIDsAndAllMetadata() throws {
+        var favorite = snapshot()
+        favorite.isFavorite = true
+        let another = SoundSnapshot(name: "Бас", machine: .wavetone, channel: 0,
+                                    parameters: ["filter.frequency": 63], tags: ["Bass"])
+        let sounds = [favorite, another]
+        let decoded = try SnapshotArchive.decode(SnapshotArchive.encode(sounds))
+        XCTAssertEqual(decoded, sounds)
+        XCTAssertEqual(decoded.map(\.id), sounds.map(\.id))
+        XCTAssertEqual(try SnapshotArchive.decode(SnapshotArchive.encode([])), [])
+    }
+
+    func testArchiveChecksSchemaBeforeReadingPayloadAndRejectsCorruptValues() throws {
+        XCTAssertThrowsError(try SnapshotArchive.decode(Data("{\"schemaVersion\":99}".utf8))) {
+            XCTAssertEqual($0 as? SnapshotStoreError, .unsupportedSchema(99))
+        }
+        XCTAssertThrowsError(try SnapshotArchive.decode(Data("{ invalid JSON".utf8))) {
+            guard let error = $0 as? SnapshotStoreError, case .unreadableLibrary = error else {
+                return XCTFail("Expected unreadable library, got \($0)")
+            }
+        }
+        let sound = snapshot()
+        let validData = try SnapshotArchive.encode([sound])
+        let invalidFields: [[String: Any]] = [
+            ["channel": 16],
+            ["name": " \n "],
+            ["parameters": ["filter.frequency": 128]],
+            ["parameters": ["unknown": 10]],
+            ["isFavorite": "yes"],
+            ["tags": "Pad"]
+        ]
+        for fields in invalidFields {
+            var object = try XCTUnwrap(JSONSerialization.jsonObject(with: validData) as? [String: Any])
+            var sounds = try XCTUnwrap(object["snapshots"] as? [[String: Any]])
+            for (key, value) in fields { sounds[0][key] = value }
+            object["snapshots"] = sounds
+            XCTAssertThrowsError(try SnapshotArchive.decode(JSONSerialization.data(withJSONObject: object)),
+                                 "Archive accepted corrupt fields \(fields)")
+        }
+        var duplicateObject = try XCTUnwrap(JSONSerialization.jsonObject(with: validData) as? [String: Any])
+        let encodedSound = try XCTUnwrap((duplicateObject["snapshots"] as? [[String: Any]])?.first)
+        duplicateObject["snapshots"] = [encodedSound, encodedSound]
+        XCTAssertThrowsError(try SnapshotArchive.decode(JSONSerialization.data(withJSONObject: duplicateObject))) {
+            XCTAssertEqual($0 as? SnapshotStoreError, .invalidSnapshot("повторяющийся идентификатор"))
+        }
+        XCTAssertThrowsError(try SnapshotArchive.encode([snapshot(channel: -1)]))
+        XCTAssertThrowsError(try SnapshotArchive.encode([sound, sound]))
+    }
+
+    func testImportSkipsIdenticalIDsAndAppendsNewSnapshots() throws {
+        let original = snapshot()
+        let newSound = snapshot(channel: 1)
+        let result = try SnapshotArchive.merge([original, newSound], into: [original])
+        XCTAssertEqual(result.snapshots, [original, newSound])
+        XCTAssertEqual(result.addedCount, 1)
+        XCTAssertEqual(result.skippedCount, 1)
+        XCTAssertEqual(result.copiedCount, 0)
+        let repeated = try SnapshotArchive.merge([original, newSound], into: result.snapshots)
+        XCTAssertEqual(repeated.snapshots, result.snapshots)
+        XCTAssertEqual(repeated.addedCount, 0)
+        XCTAssertEqual(repeated.skippedCount, 2)
+    }
+
+    func testImportCopiesIDConflictsAndPreservesBothVersions() throws {
+        let original = snapshot()
+        var edited = original
+        edited.name = "Импортированное стекло"
+        edited.parameters["filter.frequency"] = 50
+        edited.tags = ["Atmosphere"]
+        edited.isFavorite = true
+        let newSound = snapshot(channel: 1)
+        let result = try SnapshotArchive.merge([edited, newSound], into: [original])
+        XCTAssertEqual(result.snapshots.first, original)
+        XCTAssertEqual(result.snapshots.last, newSound)
+        let copy = try XCTUnwrap(result.snapshots.dropFirst().first)
+        XCTAssertNotEqual(copy.id, original.id)
+        XCTAssertNotEqual(copy.id, newSound.id)
+        XCTAssertEqual(copy.name, edited.name)
+        XCTAssertEqual(copy.machine, edited.machine)
+        XCTAssertEqual(copy.channel, edited.channel)
+        XCTAssertEqual(copy.parameters, edited.parameters)
+        XCTAssertEqual(copy.createdAt, edited.createdAt)
+        XCTAssertEqual(copy.tags, edited.tags)
+        XCTAssertEqual(copy.isFavorite, edited.isFavorite)
+        XCTAssertEqual(Set(result.snapshots.map(\.id)).count, result.snapshots.count)
+        XCTAssertEqual(result.addedCount, 2)
+        XCTAssertEqual(result.skippedCount, 0)
+        XCTAssertEqual(result.copiedCount, 1)
+        XCTAssertEqual(try SnapshotArchive.decode(SnapshotArchive.encode(result.snapshots)), result.snapshots)
+    }
+
+    func testFavoriteOnlyIDConflictIsCopiedAndMergeValidatesBothInputs() throws {
+        let original = snapshot()
+        var favorite = original
+        favorite.isFavorite = true
+        let result = try SnapshotArchive.merge([favorite], into: [original])
+        XCTAssertEqual(result.copiedCount, 1)
+        XCTAssertEqual(result.snapshots.count, 2)
+        XCTAssertFalse(result.snapshots[0].isFavorite)
+        XCTAssertTrue(result.snapshots[1].isFavorite)
+        XCTAssertThrowsError(try SnapshotArchive.merge([snapshot(channel: 16)], into: [original]))
+        XCTAssertThrowsError(try SnapshotArchive.merge([original, original], into: []))
+        XCTAssertThrowsError(try SnapshotArchive.merge([], into: [snapshot(channel: -1)]))
+    }
+
     func testInvalidChannelsParametersAndIDsCannotReplaceValidLibrary() throws {
         try withStore { store in
             let original = snapshot()

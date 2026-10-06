@@ -11,9 +11,11 @@ public struct SoundSnapshot: Identifiable, Codable, Equatable, Sendable {
     public var parameters: [String: Int]
     public let createdAt: Date
     public var tags: [String]
+    public var isFavorite: Bool
 
     public init(id: UUID = UUID(), name: String, machine: SynthMachine, channel: Int,
-                parameters: [String: Int], createdAt: Date = Date(), tags: [String] = []) {
+                parameters: [String: Int], createdAt: Date = Date(), tags: [String] = [],
+                isFavorite: Bool = false) {
         self.id = id
         self.name = name
         self.machine = machine
@@ -21,6 +23,35 @@ public struct SoundSnapshot: Identifiable, Codable, Equatable, Sendable {
         self.parameters = parameters
         self.createdAt = createdAt
         self.tags = tags
+        self.isFavorite = isFavorite
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, machine, channel, parameters, createdAt, tags, isFavorite
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(UUID.self, forKey: .id)
+        name = try values.decode(String.self, forKey: .name)
+        machine = try values.decode(SynthMachine.self, forKey: .machine)
+        channel = try values.decode(Int.self, forKey: .channel)
+        parameters = try values.decode([String: Int].self, forKey: .parameters)
+        createdAt = try values.decode(Date.self, forKey: .createdAt)
+        // These additive schema-1 fields may be absent in older libraries.
+        tags = try values.decodeIfPresent([String].self, forKey: .tags) ?? []
+        isFavorite = try values.decodeIfPresent(Bool.self, forKey: .isFavorite) ?? false
+    }
+
+    /// Trims comma-separated tags, discards empty entries and keeps the first
+    /// spelling of each tag when entries differ only in case.
+    public static func normalizedTags(from text: String) -> [String] {
+        var seen = Set<String>()
+        return text.split(separator: ",").compactMap { entry in
+            let tag = entry.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !tag.isEmpty, seen.insert(tag.lowercased()).inserted else { return nil }
+            return tag
+        }
     }
 }
 
@@ -38,6 +69,93 @@ public enum SnapshotStoreError: Error, LocalizedError, Equatable {
     }
 }
 
+public struct SnapshotImportResult: Equatable, Sendable {
+    public let snapshots: [SoundSnapshot]
+    /// Number of snapshots appended, including copies made for ID conflicts.
+    public let addedCount: Int
+    public let skippedCount: Int
+    public let copiedCount: Int
+}
+
+/// Portable JSON archives use the same versioned envelope and validation as
+/// the local library. Exporting preserves IDs so an unchanged reimport is safe.
+public enum SnapshotArchive {
+    private struct Library: Codable {
+        let schemaVersion: Int
+        let snapshots: [SoundSnapshot]
+
+        init(snapshots: [SoundSnapshot]) {
+            schemaVersion = 1
+            self.snapshots = snapshots
+        }
+
+        private enum CodingKeys: String, CodingKey { case schemaVersion, snapshots }
+
+        init(from decoder: any Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            schemaVersion = try values.decode(Int.self, forKey: .schemaVersion)
+            // Check the envelope before attempting to interpret future data.
+            guard schemaVersion == 1 else { throw SnapshotStoreError.unsupportedSchema(schemaVersion) }
+            snapshots = try values.decode([SoundSnapshot].self, forKey: .snapshots)
+        }
+    }
+
+    public static func encode(_ snapshots: [SoundSnapshot]) throws -> Data {
+        try SnapshotStore.validate(snapshots)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        return try encoder.encode(Library(snapshots: snapshots))
+    }
+
+    public static func decode(_ data: Data) throws -> [SoundSnapshot] {
+        let library: Library
+        do {
+            library = try JSONDecoder().decode(Library.self, from: data)
+        } catch let error as SnapshotStoreError {
+            throw error
+        } catch {
+            throw SnapshotStoreError.unreadableLibrary(error.localizedDescription)
+        }
+        try SnapshotStore.validate(library.snapshots)
+        return library.snapshots
+    }
+
+    /// Never overwrites existing data. Identical IDs and contents are skipped;
+    /// conflicting IDs are copied to new IDs with all other fields preserved.
+    public static func merge(_ imported: [SoundSnapshot], into existing: [SoundSnapshot]) throws -> SnapshotImportResult {
+        try SnapshotStore.validate(existing)
+        try SnapshotStore.validate(imported)
+        var snapshots = existing
+        var byID = Dictionary(uniqueKeysWithValues: existing.map { ($0.id, $0) })
+        var reservedIDs = Set(existing.map(\.id) + imported.map(\.id))
+        var skippedCount = 0
+        var copiedCount = 0
+        for snapshot in imported {
+            if byID[snapshot.id] == snapshot {
+                skippedCount += 1
+                continue
+            }
+            let added: SoundSnapshot
+            if byID[snapshot.id] != nil {
+                var newID = UUID()
+                while reservedIDs.contains(newID) { newID = UUID() }
+                reservedIDs.insert(newID)
+                added = SoundSnapshot(id: newID, name: snapshot.name, machine: snapshot.machine,
+                                      channel: snapshot.channel, parameters: snapshot.parameters,
+                                      createdAt: snapshot.createdAt, tags: snapshot.tags,
+                                      isFavorite: snapshot.isFavorite)
+                copiedCount += 1
+            } else {
+                added = snapshot
+            }
+            snapshots.append(added)
+            byID[added.id] = added
+        }
+        return SnapshotImportResult(snapshots: snapshots, addedCount: snapshots.count - existing.count,
+                                    skippedCount: skippedCount, copiedCount: copiedCount)
+    }
+}
+
 /// Versioned, atomic local storage. An unreadable existing library is never
 /// overwritten by save: the caller must deliberately move it aside first.
 public struct SnapshotStore: Sendable {
@@ -46,23 +164,15 @@ public struct SnapshotStore: Sendable {
 
     public init(directory: URL) { self.directory = directory }
 
-    private struct Library: Codable {
-        let schemaVersion: Int
-        let snapshots: [SoundSnapshot]
-    }
-
     public func load() throws -> [SoundSnapshot] {
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return [] }
-        let library: Library
+        let data: Data
         do {
-            let data = try Data(contentsOf: fileURL)
-            library = try JSONDecoder().decode(Library.self, from: data)
+            data = try Data(contentsOf: fileURL)
         } catch {
             throw SnapshotStoreError.unreadableLibrary(error.localizedDescription)
         }
-        guard library.schemaVersion == 1 else { throw SnapshotStoreError.unsupportedSchema(library.schemaVersion) }
-        try Self.validate(library.snapshots)
-        return library.snapshots
+        return try SnapshotArchive.decode(data)
     }
 
     public func save(_ snapshots: [SoundSnapshot]) throws {
@@ -70,14 +180,12 @@ public struct SnapshotStore: Sendable {
         // Also validates an existing file before allowing replacement, so a UI
         // that handled a load error cannot inadvertently erase corrupt data.
         if FileManager.default.fileExists(atPath: fileURL.path) { _ = try load() }
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        let data = try encoder.encode(Library(schemaVersion: 1, snapshots: snapshots))
+        let data = try SnapshotArchive.encode(snapshots)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         try data.write(to: fileURL, options: .atomic)
     }
 
-    private static func validate(_ snapshots: [SoundSnapshot]) throws {
+    fileprivate static func validate(_ snapshots: [SoundSnapshot]) throws {
         var ids = Set<UUID>()
         for snapshot in snapshots {
             guard ids.insert(snapshot.id).inserted else { throw SnapshotStoreError.invalidSnapshot("повторяющийся идентификатор") }

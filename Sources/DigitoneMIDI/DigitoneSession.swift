@@ -10,6 +10,7 @@ public final class DigitoneSession {
     public var onDisconnect: (() -> Void)?
     private var nrpn = NRPNDecoder()
     private var nextID: UInt16 = 20000
+    private var connectionGeneration: UInt = 0
     private struct PlayingNote: Hashable { let channel: Int; let number: Int }
     private var playingNotes: Set<PlayingNote> = []
     private struct Pending {
@@ -33,9 +34,12 @@ public final class DigitoneSession {
     }
 
     public func identify() async throws -> DeviceIdentity {
+        let generation = connectionGeneration
         identity = nil
         let device = try await request(opcode: 1)
+        guard connectionGeneration == generation else { throw MIDIConnectionError.disconnected }
         let version = try await request(opcode: 2)
+        guard connectionGeneration == generation else { throw MIDIConnectionError.disconnected }
         let result = try DeviceIdentity(deviceReply: device, versionReply: version)
         guard result.isDigitoneII else { throw MIDIConnectionError.wrongDevice(result.name) }
         identity = result
@@ -70,6 +74,13 @@ public final class DigitoneSession {
         try transport.send(MIDIBytes.nrpn(channel: channel, parameter: parameter, value: value))
     }
 
+    public func sendTimed(_ events: [TimedMIDIEvent]) throws {
+        guard identity?.isDigitoneII == true else { throw MIDIConnectionError.disconnected }
+        try transport.send(events)
+    }
+
+    public func flushTimedOutput() { transport.flushOutput() }
+
     public func audition(channel: Int, note: Int = 60) async throws {
         guard identity?.isDigitoneII == true else { throw MIDIConnectionError.disconnected }
         // Hold the original destination: a delayed note-off must never reach a newly selected device.
@@ -78,12 +89,14 @@ public final class DigitoneSession {
         try transport.send(MIDIBytes.note(channel: channel, number: note, velocity: 90, on: true))
         playingNotes.insert(playing)
         try? await Task.sleep(for: .milliseconds(450))
-        if destination == transport.destination, playingNotes.remove(playing) != nil {
+        if destination == transport.destination, playingNotes.contains(playing) {
             try transport.send(MIDIBytes.note(channel: channel, number: note, velocity: 0, on: false))
+            playingNotes.remove(playing)
         }
     }
 
     public func reset() {
+        connectionGeneration &+= 1
         identity = nil
         playingNotes.removeAll()
         nrpn = NRPNDecoder()

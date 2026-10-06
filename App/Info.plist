@@ -2,15 +2,31 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>UTExportedTypeDeclarations</key>
-    <array>
-        <dict>
-            <key>UTTypeIdentifier</key><string>studio.digitone.sysex</string>
-            <key>UTTypeDescription</key><string>Elektron SysEx</string>
-            <key>UTTypeConformsTo</key><array><string>public.data</string></array>
-            <key>UTTypeTagSpecification</key>
-            <dict><key>public.filename-extension</key><array><string>syx</string></array></dict>
-        </dict>
-    </array>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
+	</array>
+	<key>UIFileSharingEnabled</key>
+	<true/>
+	<key>UTExportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.data</string>
+			</array>
+			<key>UTTypeDescription</key>
+			<string>Elektron SysEx</string>
+			<key>UTTypeIdentifier</key>
+			<string>studio.digitone.sysex</string>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>syx</string>
+				</array>
+			</dict>
+		</dict>
+	</array>
 </dict>
 </plist>

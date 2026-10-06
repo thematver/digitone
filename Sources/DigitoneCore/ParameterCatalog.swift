@@ -59,7 +59,32 @@ public enum ParameterCatalog {
                                 section: "SYN · \(machine.title)", cc: 40 + index, nrpn: 128 + 73 + index,
                                 detail: "SYN 1 · ручка \(String(UnicodeScalar(65 + index)!)). Значение MIDI 0–127; выбранный движок должен совпадать с прибором.")
         }
-        return source + common
+        let legacy = source + common
+        let hardware = HardwareCatalog.parameters(for: DNMachine(rawValue: machine.rawValue)!)
+        let additional = hardware.filter { hardware in
+            !legacy.contains { definition in
+                hardware.nrpn.map { $0 == definition.nrpn } ?? (hardware.cc == definition.cc)
+            }
+        }.map { hardware in
+            ParameterDefinition(id: hardware.id, title: hardware.name, section: hardware.page.title,
+                                cc: hardware.cc, nrpn: hardware.nrpn ?? 0,
+                                detail: "\(hardware.page.title) · ручка \(hardware.knobLetter). Грубое значение MIDI 0–127.")
+        }
+        return legacy + additional
+    }
+
+    /// Keeps legacy snapshot IDs stable while the control surface uses the complete hardware catalog.
+    public static func definition(for hardware: DNParameter, machine: SynthMachine) -> ParameterDefinition? {
+        guard !hardware.page.isGlobal else { return nil }
+        return parameters(for: machine).first { definition in
+            hardware.nrpn.map { $0 == definition.nrpn } ?? (hardware.cc == definition.cc)
+        }
+    }
+
+    public static func hardwareParameter(for definition: ParameterDefinition, machine: SynthMachine) -> DNParameter? {
+        HardwareCatalog.parameters(for: DNMachine(rawValue: machine.rawValue)!).first { hardware in
+            hardware.nrpn.map { $0 == definition.nrpn } ?? (hardware.cc == definition.cc)
+        }
     }
 
     private static func control(_ id: String, _ title: String, _ section: String, _ cc: Int?, _ lsb: Int,

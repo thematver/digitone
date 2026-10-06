@@ -34,6 +34,7 @@ public final class MIDITransport {
     public private(set) var source: MIDIEndpoint?
     public private(set) var destination: MIDIEndpoint?
     public var onMessages: (([MIDIMessage]) -> Void)?
+    public var onTimedMessages: (([MIDIMessage], MIDITimeStamp) -> Void)?
     public var onEndpointsChanged: (() -> Void)?
     public var onDisconnect: (() -> Void)?
     public var onWillDisconnect: (() -> Void)?
@@ -42,21 +43,12 @@ public final class MIDITransport {
     private var output: MIDIPortRef = 0
     private var decoder = MIDIStreamDecoder()
     private var connectionEpoch: UInt = 0
+    private var timedConnection: TimedMIDIConnection?
 
     public init() throws {
-        try check(MIDIClientCreateWithBlock("Digitone Studio" as CFString, &client) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.refresh() }
-        }, "создание MIDI-клиента")
+        try check(MIDIClientCreateWithBlock("Digitone Studio" as CFString, &client, Self.notifyBlock(for: self)), "создание MIDI-клиента")
         do {
-            try check(MIDIInputPortCreateWithBlock(client, "Digitone input" as CFString, &input) { [weak self] list, context in
-                // Copy before the CoreMIDI callback returns; packet storage is borrowed.
-                let copied = Self.copyPackets(from: list)
-                let epoch = UInt(bitPattern: context)
-                Task { @MainActor [weak self] in
-                    guard let self, epoch == self.connectionEpoch else { return }
-                    for chunk in copied { self.onMessages?(self.decoder.feed(chunk)) }
-                }
-            }, "создание MIDI-входа")
+            try check(MIDIInputPortCreateWithBlock(client, "Digitone input" as CFString, &input, Self.readBlock(for: self)), "создание MIDI-входа")
             try check(MIDIOutputPortCreate(client, "Digitone output" as CFString, &output), "создание MIDI-выхода")
             refresh()
         } catch {
@@ -81,12 +73,15 @@ public final class MIDITransport {
         try check(MIDIPortConnectSource(input, source.reference, UnsafeMutableRawPointer(bitPattern: connectionEpoch)), "подключение входа")
         self.source = source
         self.destination = destination
+        timedConnection = TimedMIDIConnection(port: output, destination: destination.reference)
         decoder = MIDIStreamDecoder()
     }
 
     public func disconnect() {
         let wasConnected = source != nil || destination != nil
         if wasConnected { onWillDisconnect?() }
+        timedConnection?.invalidate()
+        timedConnection = nil
         if let source { MIDIPortDisconnectSource(input, source.reference) }
         connectionEpoch &+= 1
         if connectionEpoch == 0 { connectionEpoch = 1 }
@@ -117,8 +112,52 @@ public final class MIDITransport {
         try check(MIDISend(output, destination.reference, list), "отправка MIDI")
     }
 
+    public func send(_ events: [TimedMIDIEvent]) throws {
+        guard let output = timedOutput() else { throw MIDIConnectionError.disconnected }
+        try output.send(events)
+    }
+
+    public func flushOutput() { timedConnection?.flush() }
+
+    public func timedOutput() -> CoreMIDIOutput? {
+        timedConnection.map { CoreMIDIOutput(connection: $0) }
+    }
+
+    // CoreMIDI calls these blocks on its own threads. They are built outside the
+    // main actor so Swift does not infer main-actor isolation for them; they only
+    // copy data and hop to the main actor.
+    private nonisolated static func notifyBlock(for transport: MIDITransport) -> MIDINotifyBlock {
+        let reference = WeakTransport(transport)
+        return { _ in
+            Task { @MainActor in reference.value?.refresh() }
+        }
+    }
+
+    private nonisolated static func readBlock(for transport: MIDITransport) -> MIDIReadBlock {
+        let reference = WeakTransport(transport)
+        return { list, context in
+            // Copy before the CoreMIDI callback returns; packet storage is borrowed.
+            let copied = copyTimedPackets(from: list, receivedAt: HostClock.now)
+            let epoch = UInt(bitPattern: context)
+            Task { @MainActor in reference.value?.deliver(copied, epoch: epoch) }
+        }
+    }
+
+    private func deliver(_ packets: [TimedPacket], epoch: UInt) {
+        guard epoch == connectionEpoch else { return }
+        for packet in packets {
+            let messages = decoder.feed(packet.bytes)
+            onMessages?(messages)
+            if !messages.isEmpty { onTimedMessages?(messages, packet.hostTime) }
+        }
+    }
+
     nonisolated static func copyPackets(from list: UnsafePointer<MIDIPacketList>) -> [[UInt8]] {
-        var chunks: [[UInt8]] = []
+        copyTimedPackets(from: list, receivedAt: 0).map(\.bytes)
+    }
+
+    nonisolated static func copyTimedPackets(from list: UnsafePointer<MIDIPacketList>, receivedAt: MIDITimeStamp) -> [TimedPacket] {
+        var chunks: [TimedPacket] = []
         var current = UnsafeRawPointer(list)
             .advanced(by: MemoryLayout<MIDIPacketList>.offset(of: \.packet)!)
             .assumingMemoryBound(to: MIDIPacket.self)
@@ -128,7 +167,9 @@ public final class MIDITransport {
             let bytes = UnsafeRawPointer(current)
                 .advanced(by: MemoryLayout<MIDIPacket>.offset(of: \.data)!)
                 .assumingMemoryBound(to: UInt8.self)
-            chunks.append(Array(UnsafeBufferPointer(start: bytes, count: Int(current.pointee.length))))
+            let time = current.pointee.timeStamp
+            chunks.append(TimedPacket(bytes: Array(UnsafeBufferPointer(start: bytes, count: Int(current.pointee.length))),
+                                      hostTime: time == 0 ? receivedAt : time))
             current = UnsafePointer(MIDIPacketNext(current))
         }
         return chunks
@@ -146,4 +187,10 @@ public final class MIDITransport {
     private func check(_ status: OSStatus, _ operation: String) throws {
         if status != noErr { throw MIDIConnectionError.system(operation, status) }
     }
+}
+
+/// Weak, sendable handle used by CoreMIDI callbacks; only dereferenced on the main actor.
+private final class WeakTransport: @unchecked Sendable {
+    weak var value: MIDITransport?
+    init(_ value: MIDITransport) { self.value = value }
 }
